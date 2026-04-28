@@ -86,7 +86,8 @@ cp mykey_template.py mykey.py
 # Edit mykey.py and fill in your LLM API Key
 
 # 4. Launch
-python launch.pyw
+python manager.pyw   # multi-Agent manager (recommended)
+# or: python launch.pyw  # single Agent window
 ```
 
 #### Method 2: uv (for experienced Python users)
@@ -98,7 +99,8 @@ git clone https://github.com/lsdefine/GenericAgent.git
 cd GenericAgent
 uv pip install -e ".[ui]"        # Core + GUI dependencies
 cp mykey_template.py mykey.py
-python launch.pyw
+python manager.pyw                # multi-Agent manager
+# or: python launch.pyw           # single Agent window
 ```
 
 > GenericAgent is meant to grow its environment through the Agent itself, not by pre-installing every possible package.

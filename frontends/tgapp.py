@@ -707,8 +707,8 @@ async def handle_command(update, ctx):
             return await update.message.reply_text(f"✅ 已恢复 {count} 轮对话\n来源: {fname}\n(仅恢复上下文，请输入新问题继续)")
         except Exception as e:
             return await update.message.reply_text(f"❌ 恢复失败: {e}")
-    if op == '/continue':
-        if cmd != '/continue': _cancel_stream_task(ctx)
+    if op in ('/continue', '/resume'):
+        if cmd not in ('/continue', '/resume'): _cancel_stream_task(ctx)
         return await update.message.reply_text(handle_frontend_command(agent, cmd))
     return await update.message.reply_text(HELP_TEXT)
 

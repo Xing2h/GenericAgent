@@ -605,7 +605,7 @@ def handle_command(open_id, cmd, chat_id=None):
     elif op == "/new":
         _send_cmd_response(reset_conversation(agent))
     elif op == "/help":
-        _send_cmd_response("命令列表:\n/stop - 停止当前任务\n/status - 查看状态\n/llm - 查看当前模型列表\n/llm [n] - 切换到第 n 个模型\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/new - 开启新对话并清空当前上下文\n/help - 显示帮助")
+        _send_cmd_response("命令列表:\n/stop - 停止当前任务\n/status - 查看状态\n/llm - 查看当前模型列表\n/llm [n] - 切换到第 n 个模型\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/resume - 快速列出可恢复会话\n/resume [n] - 快速恢复第 n 个会话\n/new - 开启新对话并清空当前上下文\n/help - 显示帮助")
     elif op == "/status":
         llm = agent.get_llm_name() if agent.llmclient else "未配置"
         _send_cmd_response(f"状态: {'🔴 运行中' if agent.is_running else '🟢 空闲'}\nLLM: [{agent.llm_no}] {llm}")
@@ -631,7 +631,7 @@ def handle_command(open_id, cmd, chat_id=None):
             _send_cmd_response(f"已恢复 {count} 轮对话\n来源: {fname}\n(仅恢复上下文，请输入新问题继续)")
         except Exception as e:
             _send_cmd_response(f"恢复失败: {e}")
-    elif op == "/continue" or cmd.startswith("/continue"):
+    elif op in ("/continue", "/resume") or cmd.startswith("/continue") or cmd.startswith("/resume"):
         _send_cmd_response(handle_continue_frontend(agent, cmd))
     else:
         _send_cmd_response(f"未知命令: {cmd}")

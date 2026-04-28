@@ -120,8 +120,11 @@ class GeneraticAgent:
             setattr(self.llmclient.backend, k, v)
             display_queue.put({'done': smart_format(f"✅ session.{k} = {repr(v)}", max_str_len=500), 'source': 'system'})
             return None
-        if raw_query.strip() == '/resume':
-            return r'扫temp/model_responses/下时间最近的10个文件(除本PID)，读取每个文件content后先replace("\\n","\n").replace("\\r","\r")统一为真换行，再用re.findall(r"<history>\n\[(?:USER|Agent)\].*?</history>", content, re.DOTALL)提取，取每文件最后一个匹配作为该会话内容，按mtime倒序，每个用一句话总结聊了什么让我选择；选定后再简单读该文件末尾作为聊天基础'
+        if re.match(r'^/resume(?:\s+\d+)?\s*$', raw_query.strip()):
+            frontends_dir = os.path.join(script_dir, 'frontends')
+            if frontends_dir not in sys.path: sys.path.append(frontends_dir)
+            from continue_cmd import handle as _handle_continue_cmd
+            return _handle_continue_cmd(self, raw_query, display_queue)
         return raw_query
 
     def run(self):

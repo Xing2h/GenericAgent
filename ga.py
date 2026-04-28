@@ -32,10 +32,12 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
         return {"status": "error", "msg": f"不支持的类型: {code_type}"}
     print("code run output:") 
     startupinfo = None
+    creationflags = 0
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 0 # SW_HIDE
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     full_stdout = []
 
     def stream_reader(proc, logs):
@@ -51,7 +53,8 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
     try:
         process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=0, cwd=cwd, startupinfo=startupinfo
+            bufsize=0, cwd=cwd, startupinfo=startupinfo,
+            creationflags=creationflags
         )
         start_t = time.time()
         t = threading.Thread(target=stream_reader, args=(process, full_stdout), daemon=True)

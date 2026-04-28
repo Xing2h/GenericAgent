@@ -197,8 +197,8 @@ if prompt := st.chat_input("any task?"):
     if cmd == "/new":
         st.session_state.messages = [{"role": "assistant", "content": reset_conversation(agent), "time": ts}]
         _reset_and_rerun()
-    if cmd.startswith("/continue"):
-        m = re.match(r'/continue\s+(\d+)\s*$', cmd.strip())
+    if cmd.startswith("/continue") or cmd.startswith("/resume"):
+        m = re.match(r'/(?:continue|resume)\s+(\d+)\s*$', cmd.strip())
         sessions = list_sessions(exclude_pid=os.getpid()) if m else []
         idx = int(m.group(1)) - 1 if m else -1
         # Resolve target path BEFORE handle (which snapshots current log, shifting indices).

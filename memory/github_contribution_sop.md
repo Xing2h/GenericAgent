@@ -98,6 +98,8 @@ PR 提交后等 CI：
 | commit message 写 "update" | 写具体改了什么 |
 | force push 覆盖 review 历史 | 追加 commit |
 | PR 描述空白 | 写 What/Why/Testing |
+| PowerShell 里直接写 `git stash apply stash@{0}` / `drop stash@{0}` | 对 `stash@{0}` 加引号，如 `git stash apply 'stash@{0}'` |
+| 工作树里已去掉冲突标记但 `git status` 仍是 `UU` | 还需 `git add 冲突文件`，索引才会标记为 resolved |
 
 ## 跟进状态机
 

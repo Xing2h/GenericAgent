@@ -8,6 +8,8 @@ HELP_COMMANDS = (
     ("/restore", "恢复上次对话历史"),
     ("/continue", "列出可恢复会话"),
     ("/continue [n]", "恢复第 n 个会话"),
+    ("/resume", "快速列出可恢复会话（同 /continue）"),
+    ("/resume [n]", "快速恢复第 n 个会话"),
     ("/llm", "查看当前模型列表"),
     ("/llm [n]", "切换到第 n 个模型"),
 )
@@ -18,6 +20,7 @@ TELEGRAM_MENU_COMMANDS = (
     ("new", "开启新对话并清空当前上下文"),
     ("restore", "恢复上次对话历史"),
     ("continue", "列出可恢复会话；/continue n 恢复第 n 个"),
+    ("resume", "快速列出/恢复会话；/resume n 恢复第 n 个"),
     ("llm", "查看模型列表；/llm n 切换到指定模型"),
 )
 
@@ -296,7 +299,7 @@ class AgentChatMixin:
                 return await self.send_text(chat_id, f"✅ 已恢复 {count} 轮对话\n来源: {fname}\n(仅恢复上下文，请输入新问题继续)", **ctx)
             except Exception as e:
                 return await self.send_text(chat_id, f"❌ 恢复失败: {e}", **ctx)
-        if op == "/continue":
+        if op in ("/continue", "/resume"):
             return await self.send_text(chat_id, _handle_continue_frontend(self.agent, cmd), **ctx)
         if op == "/new":
             return await self.send_text(chat_id, _reset_conversation(self.agent), **ctx)

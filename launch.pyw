@@ -19,7 +19,10 @@ def get_screen_width():
 def start_streamlit(port):
     global proc
     cmd = [sys.executable, "-m", "streamlit", "run", os.path.join(frontends_dir, "stapp.py"), "--server.port", str(port), "--server.address", "localhost", "--server.headless", "true"]
-    proc = subprocess.Popen(cmd)
+    kwargs = {}
+    if os.name == 'nt':
+        kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    proc = subprocess.Popen(cmd, **kwargs)
     atexit.register(proc.kill)
 
 def inject(text):

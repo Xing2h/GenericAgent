@@ -164,9 +164,9 @@ def reset_conversation(agent, message='🆕 已开启新对话，当前上下文
         agent.handler = None
     return message
 
-def format_list(sessions, limit=20):
+def format_list(sessions, limit=20, command='/continue'):
     if not sessions: return '❌ 没有可恢复的历史会话'
-    lines = ['**可恢复会话**（输入 `/continue N` 恢复第 N 个）：', '']
+    lines = [f'**可恢复会话**（输入 `{command} N` 恢复第 N 个）：', '']
     for i, (_, mtime, first, n) in enumerate(sessions[:limit], 1):
         preview = _escape_md((first or '（无法预览）').replace('\n', ' ')[:60])
         lines.append(f'{i}. `{_rel_time(mtime)}` · **{n} 轮** · {preview}')
@@ -195,23 +195,24 @@ def restore(agent, path):
     return f'⚠️ 非 native 格式，已降级恢复 {n} 轮摘要（{name}）\n(请输入新问题继续)', False
 
 def handle(agent, query, display_queue):
-    """Dispatch /continue or /continue N. Returns None if consumed else original query."""
+    """Dispatch /continue|/resume or /continue|/resume N. Returns None if consumed else original query."""
     s = (query or '').strip()
-    if s == '/continue':
-        display_queue.put({'done': format_list(list_sessions(exclude_pid=os.getpid())), 'source': 'system'})
+    m = re.match(r'/(continue|resume)(?:\s+(\d+))?\s*$', s)
+    if not m:
+        return query
+    cmd = '/' + m.group(1)
+    if m.group(2) is None:
+        display_queue.put({'done': format_list(list_sessions(exclude_pid=os.getpid()), command=cmd), 'source': 'system'})
         return None
-    m = re.match(r'/continue\s+(\d+)\s*$', s)
-    if m:
-        sessions = list_sessions(exclude_pid=os.getpid())
-        idx = int(m.group(1)) - 1
-        if not (0 <= idx < len(sessions)):
-            display_queue.put({'done': f'❌ 索引越界（有效范围 1-{len(sessions)}）', 'source': 'system'})
-            return None
-        reset_conversation(agent, message=None)
-        msg, _ = restore(agent, sessions[idx][0])
-        display_queue.put({'done': msg, 'source': 'system'})
+    sessions = list_sessions(exclude_pid=os.getpid())
+    idx = int(m.group(2)) - 1
+    if not (0 <= idx < len(sessions)):
+        display_queue.put({'done': f'❌ 索引越界（有效范围 1-{len(sessions)}）', 'source': 'system'})
         return None
-    return query
+    reset_conversation(agent, message=None)
+    msg, _ = restore(agent, sessions[idx][0])
+    display_queue.put({'done': msg, 'source': 'system'})
+    return None
 
 
 def _user_text(prompt_body):
@@ -266,16 +267,17 @@ def extract_ui_messages(path):
 
 
 def handle_frontend_command(agent, query, exclude_pid=None):
-    """Frontend-friendly /continue entry that returns text directly."""
+    """Frontend-friendly /continue|/resume entry that returns text directly."""
     s = (query or '').strip()
     exclude_pid = os.getpid() if exclude_pid is None else exclude_pid
-    if s == '/continue':
-        return format_list(list_sessions(exclude_pid=exclude_pid))
-    m = re.match(r'/continue\s+(\d+)\s*$', s)
+    m = re.match(r'/(continue|resume)(?:\s+(\d+))?\s*$', s)
     if not m:
-        return '用法: /continue 或 /continue N'
+        return '用法: /continue 或 /continue N（/resume 同义）'
+    cmd = '/' + m.group(1)
+    if m.group(2) is None:
+        return format_list(list_sessions(exclude_pid=exclude_pid), command=cmd)
     sessions = list_sessions(exclude_pid=exclude_pid)
-    idx = int(m.group(1)) - 1
+    idx = int(m.group(2)) - 1
     if not (0 <= idx < len(sessions)):
         return f'❌ 索引越界（有效范围 1-{len(sessions)}）'
     reset_conversation(agent, message=None)
@@ -284,11 +286,11 @@ def handle_frontend_command(agent, query, exclude_pid=None):
 
 
 def install(cls):
-    """Wrap cls._handle_slash_cmd so /continue is handled before original dispatch."""
+    """Wrap cls._handle_slash_cmd so /continue and /resume are handled before original dispatch."""
     orig = cls._handle_slash_cmd
     if getattr(orig, '_continue_patched', False): return
     def patched(self, raw_query, display_queue):
-        if (raw_query or '').startswith('/continue'):
+        if re.match(r'^/(?:continue|resume)(?:\s+\d+)?\s*$', raw_query or ''):
             r = handle(self, raw_query, display_queue)
             if r is None: return None
         return orig(self, raw_query, display_queue)
