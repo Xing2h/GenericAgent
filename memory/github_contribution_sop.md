@@ -100,6 +100,7 @@ PR 提交后等 CI：
 | PR 描述空白 | 写 What/Why/Testing |
 | PowerShell 里直接写 `git stash apply stash@{0}` / `drop stash@{0}` | 对 `stash@{0}` 加引号，如 `git stash apply 'stash@{0}'` |
 | 工作树里已去掉冲突标记但 `git status` 仍是 `UU` | 还需 `git add 冲突文件`，索引才会标记为 resolved |
+| 冲突已解决且已 `git add`，但 `git merge --continue --no-edit` 不通过 | 可直接 `git commit --no-edit` 完成当前 merge |
 
 ## 跟进状态机
 
