@@ -17,6 +17,7 @@ import os
 import queue
 import re
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ try:
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.message import Message
+    from textual.screen import ModalScreen
     from textual.widgets import OptionList, Static, TextArea
     from textual.widgets.option_list import Option
 except ModuleNotFoundError as exc:
@@ -139,6 +141,7 @@ class ChatMessage:
     choices: list = field(default_factory=list)   # [(label, value), ...]
     on_select: Optional[Callable] = field(default=None, repr=False)
     selected_label: Optional[str] = None
+    image_paths: list[str] = field(default_factory=list)
     # Mounted widget refs (None until mounted)
     _role_widget: Any = field(default=None, repr=False)
     _hint_widget: Any = field(default=None, repr=False)
@@ -193,9 +196,19 @@ COMMANDS = [
 # ---------- 交互式选择 widget ----------
 class ChoiceList(OptionList):
     """OptionList 子类，记住所属 ChatMessage，便于选中后回填。"""
+    BINDINGS = [*OptionList.BINDINGS,
+                Binding("right", "select", "Select", show=False),
+                Binding("escape", "cancel", "Cancel", show=False)]
+
     def __init__(self, msg: "ChatMessage", **kwargs):
         super().__init__(**kwargs)
         self.msg = msg
+
+    def action_cancel(self) -> None:
+        try:
+            self.app._cancel_choice(self.msg)
+        except Exception:
+            pass
 
 
 class SelectableStatic(Static):
@@ -220,22 +233,106 @@ class SelectableStatic(Static):
         return selection.extract("\n".join(lines)), "\n"
 
 
+
+def _save_clipboard_image() -> Optional[str]:
+    """Best-effort cross-platform clipboard image import; returns a PNG path or None."""
+    try:
+        from PIL import ImageGrab, Image
+    except Exception:
+        return None
+    try:
+        data = ImageGrab.grabclipboard()
+    except Exception:
+        return None
+    if data is None:
+        return None
+    try:
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, str) and os.path.isfile(item):
+                    return item
+            return None
+        if isinstance(data, Image.Image):
+            out_dir = os.path.join(tempfile.gettempdir(), "genericagent_tui_clipboard")
+            os.makedirs(out_dir, exist_ok=True)
+            path = os.path.join(out_dir, f"clipboard_{int(time.time() * 1000)}.png")
+            data.save(path, "PNG")
+            return path
+    except Exception:
+        return None
+    return None
+
+
 class InputArea(TextArea):
     """多行输入框：Enter 发送 / Ctrl+J 等换行 / 粘贴 >2 行收为 [Pasted text #N +M lines]。"""
     _PASTE_RE = re.compile(r'\[Pasted text #(\d+) \+\d+ lines\]')
+    # 短形式 `[Image #N]` 折叠占位符；提交时 expand_placeholders 把 N 映射回 _pastes
+    # 里登记的原始路径文本，模型侧仍按裸路径处理。容忍长形式 `[Image #N: ...]`
+    # 是为向后兼容历史会话/手工输入，但当前 _paste_image_from_clipboard 只产出短形式。
+    _IMAGE_RE = re.compile(r'\[Image #(\d+)(?::[^\]]*)?\]')
 
     BINDINGS = [
         Binding("ctrl+j",      "newline", "Newline", show=False),
-        Binding("alt+enter",   "newline", "Newline", show=False),
         Binding("ctrl+enter",  "newline", "Newline", show=False),
         Binding("shift+enter", "newline", "Newline", show=False),
-        # 拆掉父类 ctrl+v：父类会走 action_paste 从 app.clipboard 再插一次，
-        # 和终端 bracketed paste 触发的 _on_paste 双重插入 → 单行粘贴会重复
-        Binding("ctrl+v",      "noop",    "Noop",    show=False),
+        # Ctrl+V 优先尝试系统图片剪贴板；无图片时再走 Textual 文本剪贴板。
+        Binding("ctrl+v",      "paste", "Paste", show=False),
+        # Ctrl+U: Unix 终端约定的 "kill line"，此处复用为整框清空（无选区时）。
+        # 跨平台一致：Windows ConPTY / macOS Terminal / Linux 各家终端均原生支持 Ctrl+U 键码。
+        Binding("ctrl+u",      "clear_input", "ClearInput", show=False),
     ]
 
     def action_noop(self) -> None:
         pass
+
+    def action_clear_input(self) -> None:
+        """Ctrl+U: 一键清空整个输入框（无视选区/光标位置），跨平台终端通用。
+
+        相当于 readline 的 unix-line-discard，所有主流终端原生透传该键码。
+        """
+        self.reset()
+        # 同步重置历史浏览状态，避免清空后再按 ↑ 仍处于"浏览中"
+        self._history_index = -1
+        self._history_stash = ""
+        try:
+            self.app._hide_palette()
+        except Exception:
+            pass
+        try:
+            self.app._resize_input(self)
+        except Exception:
+            pass
+
+    def _insert_via_keyboard(self, text: str) -> None:
+        result = self._replace_via_keyboard(text, *self.selection)
+        if result:
+            self.move_cursor(result.end_location)
+            self.focus()
+            try:
+                self.app._resize_input(self)
+            except Exception:
+                pass
+
+    def _paste_image_from_clipboard(self) -> bool:
+        path = _save_clipboard_image()
+        if not path:
+            return False
+        self._paste_counter += 1
+        sid = self._paste_counter
+        # 折叠占位符：输入框/Ctrl+C 只看到 `[Image #N]`，路径在 _pastes 里登记，
+        # 提交瞬间由 expand_placeholders 展开为裸路径文本喂给模型。
+        self._pastes[sid] = path
+        self._insert_via_keyboard(f"[Image #{sid}]")
+        return True
+
+    def action_paste(self) -> None:
+        if self.read_only or self._paste_image_from_clipboard():
+            return
+        if clipboard := getattr(self.app, "clipboard", ""):
+            self._insert_via_keyboard(clipboard)
+
+    def action_paste_image(self) -> None:
+        self._paste_image_from_clipboard()
 
     class Submitted(Message):
         def __init__(self, input_area: "InputArea", value: str) -> None:
@@ -247,65 +344,153 @@ class InputArea(TextArea):
         super().__init__(*args, **kwargs)
         self._pastes: dict[int, str] = {}
         self._paste_counter = 0
+        # ---- input history (shell-style ↑/↓) ----
+        self._input_history: list[str] = []   # oldest first
+        self._history_index: int = -1         # -1 = not browsing
+        self._history_stash: str = ""         # unsaved draft while browsing
+        self._HISTORY_MAX = 200
 
     def expand_placeholders(self, text: str) -> str:
-        def repl(m):
+        def repl_paste(m):
             sid = int(m.group(1))
             return self._pastes.get(sid, m.group(0))
-        return self._PASTE_RE.sub(repl, text)
+        def repl_image(m):
+            sid = int(m.group(1))
+            return self._pastes.get(sid, m.group(0))
+        text = self._PASTE_RE.sub(repl_paste, text)
+        return self._IMAGE_RE.sub(repl_image, text)
+
+    # ---- history public API ----
+    def record_history(self, raw_text: str) -> None:
+        """Called on submit; stores non-empty entries, deduplicates last."""
+        stripped = raw_text.strip()
+        if not stripped:
+            return
+        if self._input_history and self._input_history[-1] == stripped:
+            pass  # skip consecutive duplicate
+        else:
+            self._input_history.append(stripped)
+            if len(self._input_history) > self._HISTORY_MAX:
+                self._input_history = self._input_history[-self._HISTORY_MAX:]
+        self._history_index = -1
+        self._history_stash = ""
+
+    def _suppress_palette_next_change(self) -> None:
+        """让下一次 on_text_area_changed 跳过 palette 自动弹出。
+        与 palette 选项确认共用同一机制（L1010），单次消费、天然防递归。"""
+        try:
+            self.app._suppress_palette_open = True
+        except Exception:
+            pass
+
+    def _history_up(self) -> bool:
+        """回到更旧的一条历史；到最旧时只吞掉按键。"""
+        if not self._input_history:
+            return False
+        if self._history_index == -1:
+            # start browsing: stash current draft
+            self._history_stash = self.text
+            self._history_index = len(self._input_history) - 1
+        elif self._history_index > 0:
+            self._history_index -= 1
+        else:
+            return True  # 已在最旧项，直接吞键
+        self._suppress_palette_next_change()
+        self.text = self._input_history[self._history_index]
+        return True
+
+    def _history_down(self) -> bool:
+        """Move to newer entry or restore draft. Returns True if handled."""
+        if self._history_index == -1:
+            return False  # not browsing
+        if self._history_index < len(self._input_history) - 1:
+            self._history_index += 1
+            new_text = self._input_history[self._history_index]
+        else:
+            # 回到草稿
+            self._history_index = -1
+            new_text = self._history_stash
+        self._suppress_palette_next_change()
+        self.text = new_text
+        return True
 
     def reset(self) -> None:
         self.text = ""
         self._pastes.clear()
         self._paste_counter = 0
+        self._history_index = -1
+        self._history_stash = ""
 
     def action_newline(self) -> None:
-        result = self._replace_via_keyboard("\n", *self.selection)
-        if result:
-            self.move_cursor(result.end_location)
+        self._insert_via_keyboard("\n")
 
     async def _on_paste(self, event: events.Paste) -> None:
+        # 终端 Ctrl+V 在 bracketed-paste 模式下走这里（绕过 action_paste）。
+        # 优先尝试系统剪贴板里的图片：命中则插占位、原 paste 文本丢弃。
         if self.read_only:
             return
-        # 终端 bracketed paste 在 Windows 上常把行尾送成 \r\n 或裸 \r，
-        # 直接塞进 document 会丢换行（\r 不被当行尾），归一成 \n 再交给 super
-        event.text = event.text.replace("\r\n", "\n").replace("\r", "\n")
-        text = event.text
+        if self._paste_image_from_clipboard():
+            event.stop(); event.prevent_default(); return
+        text = event.text.replace("\r\n", "\n").replace("\r", "\n")
         line_count = len(text.splitlines()) or 1
         if line_count > 2:
             self._paste_counter += 1
             sid = self._paste_counter
             self._pastes[sid] = text
-            placeholder = f"[Pasted text #{sid} +{line_count} lines]"
-            result = self._replace_via_keyboard(placeholder, *self.selection)
-            if result:
-                self.move_cursor(result.end_location)
-                self.focus()
-            event.stop(); event.prevent_default()
-            return
-        await super()._on_paste(event)
+            text = f"[Pasted text #{sid} +{line_count} lines]"
+        self._insert_via_keyboard(text)
+        event.stop(); event.prevent_default()
 
     async def _on_key(self, event: events.Key) -> None:
+        # 1) 命令面板 (#palette) 路由
         try:
             palette = self.app.query_one("#palette", OptionList)
         except Exception:
             palette = None
         if palette is not None and palette.has_class("-visible"):
             routes = {"up": palette.action_cursor_up, "down": palette.action_cursor_down}
-            if event.key == "enter" and palette.highlighted is not None:
-                routes["enter"] = palette.action_select
+            if event.key in {"enter", "right"} and palette.highlighted is not None:
+                routes[event.key] = palette.action_select
+            elif event.key == "left":
+                routes["left"] = self.app._hide_palette
             fn = routes.get(event.key)
             if fn:
                 fn(); event.stop(); event.prevent_default(); return
+        # 2) 内嵌 ChoiceList 路由 (ccstatusline 风格)：↑↓ 移动 / → 或 Enter 确认 / Esc 取消。
+        #    不依赖焦点转移：只要存在未选定的 ChoiceList，方向键就被借走。
+        choice = getattr(self.app, "_active_choice", lambda: None)()
+        if choice is not None:
+            if event.key == "up":
+                choice.action_cursor_up(); event.stop(); event.prevent_default(); return
+            if event.key == "down":
+                choice.action_cursor_down(); event.stop(); event.prevent_default(); return
+            if event.key in ("enter", "right") and choice.highlighted is not None:
+                choice.action_select(); event.stop(); event.prevent_default(); return
+            if event.key == "escape":
+                self.app._cancel_choice(choice.msg); event.stop(); event.prevent_default(); return
+        # 3) 输入历史：只在首行首列 / 尾行尾列时接管 ↑/↓。既保留原有光标移动，又允许在行内任意位置浏览历史（不强制先跳到行首/行尾）。
+        if event.key == "up" and self.cursor_location == (0, 0):
+            if self._history_up():
+                event.stop(); event.prevent_default(); return
+        if event.key == "down":
+            row, col = self.cursor_location
+            lines = self.text.split("\n")
+            if row == len(lines) - 1 and col == len(lines[-1]):
+                if self._history_down():
+                    event.stop(); event.prevent_default(); return
         if event.key == "enter":  # 换行键已被 BINDINGS 拦走
             event.stop(); event.prevent_default()
             self.post_message(self.Submitted(self, self.text))
             return
+        # Any real editing resets history browsing index
+        if self._history_index != -1 and event.key not in ("up", "down", "left", "right"):
+            self._history_index = -1
         await super()._on_key(event)
 
 
 # ---------- 顶部栏 ----------
-def render_topbar(session_name: str, status: str, model: str, tasks_running: int) -> Table:
+def render_topbar(session_name: str, status: str, model: str, tasks_running: int,
+                  fold_mode: bool = True) -> Table:
     t = Table.grid(expand=True)
     t.add_column(ratio=1, justify="left")
     t.add_column(ratio=1, justify="center")
@@ -320,6 +505,9 @@ def render_topbar(session_name: str, status: str, model: str, tasks_running: int
     dot_color = C_GREEN if status == "running" else C_DIM
     left.append("● ", style=dot_color)
     left.append(status, style=C_MUTED)
+    if fold_mode:
+        left.append("    ")
+        left.append("▾ fold", style=C_DIM)
 
     mid = Text()
     mid.append("model: ", style=C_MUTED)
@@ -335,23 +523,22 @@ def render_topbar(session_name: str, status: str, model: str, tasks_running: int
     return t
 
 
-def render_bottombar() -> Table:
+def render_bottombar(quit_armed: bool = False) -> Table:
     t = Table.grid(expand=True)
-    t.add_column(ratio=2, justify="left")
-    t.add_column(ratio=1, justify="right")
+    t.add_column(justify="left")
     left = Text()
-    pairs = [("Enter", "发送"), ("↑/↓", "选择"),
-             ("Ctrl+N", "新会话"), ("Ctrl+B", "侧栏"),
-             ("Ctrl+F", "折叠"), ("Ctrl+S", "停止")]
-    for i, (k, d) in enumerate(pairs):
-        if i: left.append("    ")
-        left.append(k, style=C_FG)
-        left.append(" ")
-        left.append(d, style=C_MUTED)
-    right = Text()
-    right.append("/", style=C_GREEN)
-    right.append(" 命令面板", style=C_MUTED)
-    t.add_row(left, right)
+    if quit_armed:
+        left.append("再按 Ctrl+C 退出", style=f"bold {C_GREEN}")
+    else:
+        pairs = [("Enter", "发送"), ("Ctrl+N", "新会话"),
+                 ("Ctrl+B", "侧栏"), ("Ctrl+C", "停止/退出"),
+                 ("/", "命令面板"), ("Ctrl+/", "快捷键帮助")]
+        for i, (k, d) in enumerate(pairs):
+            if i: left.append("    ")
+            left.append(k, style=C_GREEN if k in ("/", "Ctrl+/") else C_FG)
+            left.append(" ")
+            left.append(d, style=C_MUTED)
+    t.add_row(left)
     return t
 
 
@@ -423,6 +610,37 @@ def render_sidebar(sessions: dict[int, AgentSession], current_id: Optional[int])
 
 
 # ---------- App ----------
+
+
+class HelpScreen(ModalScreen):
+    """快捷键帮助 modal — push 上来覆盖主屏幕，Esc / Ctrl+/ 关闭，不影响下层输入框位置。"""
+    CSS = """
+    HelpScreen { align: center middle; }
+    HelpScreen > Static {
+        width: auto;
+        max-width: 80;
+        height: auto;
+        max-height: 80%;
+        background: #21262d;
+        border: solid #30363d;
+        padding: 1 2;
+        color: #c9d1d9;
+    }
+    """
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close", show=False),
+        Binding("ctrl+slash", "dismiss", "Close", show=False),
+        Binding("ctrl+/", "dismiss", "Close", show=False),
+        Binding("ctrl+underscore", "dismiss", "Close", show=False),
+    ]
+
+    def __init__(self, content) -> None:
+        super().__init__()
+        self._content = content
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._content)
+
 
 class GenericAgentTUI(App[None]):
 
@@ -520,14 +738,17 @@ class GenericAgentTUI(App[None]):
     """
 
     BINDINGS = [
+        Binding("ctrl+c",     "handle_ctrl_c", "Stop/Quit", show=False, priority=True),
         Binding("ctrl+n",     "new_session",   "New",   show=False),
         Binding("ctrl+b",     "toggle_sidebar","Sidebar", show=False),
-        Binding("ctrl+s",     "stop_current",  "Stop",  show=False),
-        Binding("ctrl+f",     "toggle_fold",   "Fold",  show=False),
-        Binding("ctrl+q",     "quit",          "Quit",  show=False),
-        Binding("ctrl+left",  "prev_session",  "Prev",  show=False, priority=True),
-        Binding("ctrl+right", "next_session",  "Next",  show=False, priority=True),
-        Binding("escape",     "close_palette", "Close", show=False),
+        Binding("ctrl+o",     "toggle_fold",   "Fold",  show=False),
+        Binding("ctrl+up",    "prev_session",  "Prev",  show=False, priority=True),
+        Binding("ctrl+down",  "next_session",  "Next",  show=False, priority=True),
+        # Ctrl+/ — 终端常报为 ctrl+slash 或 legacy ctrl+_（=ASCII 0x1F），都绑上以兜底
+        Binding("ctrl+slash", "show_help", "Help", show=False),
+        Binding("ctrl+/",     "show_help", "Help", show=False),
+        Binding("ctrl+underscore", "show_help", "Help", show=False),
+        Binding("escape",     "escape",        "Close", show=False),
         Binding("tab",        "complete_command", "Complete", show=False, priority=True),
     ]
 
@@ -538,8 +759,11 @@ class GenericAgentTUI(App[None]):
         self.current_id: Optional[int] = None
         self._ids = count(1)
         self._suppress_palette_open = False   # 选中 option 后抑制下一次 on_input_changed 重开 palette
-        self.fold_mode: bool = True           # 折叠已完成的 turn，Ctrl+F 切
-        self._last_width: int = -1            # 轮询时检测变化用（Windows 窗口吸附/全屏不发 resize 时的兜底）
+        self.fold_mode: bool = True           # 折叠已完成的 turn，Ctrl+O 切
+        self._last_size: tuple[int, int] = (-1, -1)  # 同尺寸去重 + tick 兜底（Windows 窗口吸附不发 resize）
+        self._resize_timer = None             # 拖拽 resize 80ms 防抖，避免每帧全量重挂载
+        self._quit_armed: bool = False        # Ctrl+C 双击退出：第一次按设 True，2s 内再按则真正退出
+        self._quit_timer = None               # 配合 _quit_armed 的兜底清除定时器
 
     def compose(self) -> ComposeResult:
         yield Static("", id="topbar")
@@ -566,13 +790,20 @@ class GenericAgentTUI(App[None]):
         self.set_interval(0.5, self._tick)
         self._patch_auto_scroll_for_selection()
         self._apply_responsive_layout()
+        # Disable alternate scroll mode (?1007). Textual 开 ?1006 SGR mouse 但没关 ?1007；
+        # macOS Terminal.app / iTerm2 默认 profile 的 ?1007 是 ON，滚轮会同时发 mouse 事件
+        # 和 ↑/↓ 按键 → InputArea 历史导航被误触发。退出 alt screen 自动失效，不需要恢复。
+        try:
+            sys.stdout.write("\x1b[?1007l"); sys.stdout.flush()
+        except Exception:
+            pass
 
     def _tick(self) -> None:
         """0.5s 轮询：刷顶栏时间 + 兜底检测尺寸变化（Windows 窗口吸附/全屏不发 resize）。"""
         self._refresh_topbar()
-        w = self.size.width
-        if w != self._last_width:
-            self._last_width = w
+        size = (self.size.width, self.size.height)
+        if size != self._last_size:
+            self._last_size = size
             self._apply_responsive_layout()
 
     def _patch_auto_scroll_for_selection(self) -> None:
@@ -672,8 +903,61 @@ class GenericAgentTUI(App[None]):
         self.current_id = ids[(i + 1) % len(ids)]
         self._refresh_all()
 
-    def action_stop_current(self) -> None:
-        self._cmd_stop([])
+    def action_handle_ctrl_c(self) -> None:
+        """Ctrl+C 跨场景统一入口：跑任务时中断；否则首次清空输入框 + 武装退出，
+        2s 内再按退出。与 CC 双击退出协议对齐，输入框非空时不会一键退出。"""
+        # 0) 有选区 → 保持终端/TUI 复制语义，不触发 stop / clear / quit。
+        try:
+            selected_text = self.screen.get_selected_text()
+        except Exception:
+            selected_text = None
+        if selected_text:
+            try: self.copy_to_clipboard(selected_text)
+            except Exception: pass
+            self._disarm_quit()
+            return
+        # 1) 任务在跑 → 中断（不武装退出，避免误关）
+        try: sess = self.current
+        except Exception: sess = None
+        if sess is not None and sess.status == "running":
+            self._cmd_stop([])
+            self._disarm_quit()
+            return
+        # 2) 已武装 → 真正退出
+        if self._quit_armed:
+            self.exit()
+            return
+        # 3) 首次按：输入框有内容则清空，无论空满都武装并提示
+        try:
+            inp = self.query_one("#input", InputArea)
+        except Exception:
+            inp = None
+        if inp is not None and inp.text:
+            inp.reset()
+            try: self._resize_input(inp)
+            except Exception: pass
+        self._quit_armed = True
+        self._refresh_bottombar()
+        if self._quit_timer is not None:
+            try: self._quit_timer.stop()
+            except Exception: pass
+        self._quit_timer = self.set_timer(2.0, self._disarm_quit)
+
+    def _disarm_quit(self) -> None:
+        if not self._quit_armed and self._quit_timer is None:
+            return
+        self._quit_armed = False
+        if self._quit_timer is not None:
+            try: self._quit_timer.stop()
+            except Exception: pass
+            self._quit_timer = None
+        try: self._refresh_bottombar()
+        except Exception: pass
+
+    def on_key(self, event: events.Key) -> None:
+        """非 Ctrl+C 的任何键都解除退出武装状态，避免错按后僵在 armed。"""
+        if self._quit_armed and event.key != "ctrl+c":
+            self._disarm_quit()
 
     def action_toggle_sidebar(self) -> None:
         self.query_one("#sidebar", Static).toggle_class("-hidden")
@@ -687,11 +971,60 @@ class GenericAgentTUI(App[None]):
                     m._cached_body = None
                     m._cache_key = ()
         self._remount_current_session()
+        self._refresh_topbar()
         self.notify(f"Fold: {'on' if self.fold_mode else 'off'}", timeout=1)
 
-    def action_close_palette(self) -> None:
-        self._hide_palette()
-        self.query_one("#input", InputArea).focus()
+    def action_escape(self) -> None:
+        """Esc 统一入口：choice → palette → 兜底解除 quit 武装。
+        HelpScreen 自己绑了 Esc 拦截，到这里时它已经被 pop 掉。"""
+        # 1) 还有未选定的 choice → 取消
+        choice = self._active_choice()
+        if choice is not None:
+            self._cancel_choice(choice.msg)
+            return
+        # 2) 命令面板可见 → 关闭
+        try:
+            palette = self.query_one("#palette", OptionList)
+        except Exception:
+            palette = None
+        if palette is not None and palette.has_class("-visible"):
+            self._hide_palette()
+            self.query_one("#input", InputArea).focus()
+            return
+        # 3) armed → 解除（on_key 兜底通常已处理；这里仅显式情形）
+        self._disarm_quit()
+
+    def action_show_help(self) -> None:
+        # 已经在 HelpScreen 上 → 关掉；否则 push 一个新的（ModalScreen 不影响下层布局，输入框不动）
+        if isinstance(self.screen, HelpScreen):
+            self.pop_screen()
+        else:
+            self.push_screen(HelpScreen(self._render_help()))
+
+    def _render_help(self) -> Text:
+        rows = [
+            ("Enter",                   "发送"),
+            ("Ctrl+J / Ctrl+Enter",     "换行（Shift+Enter 同义）"),
+            ("Ctrl+C",                  "停止任务 / 空闲时连按两次退出"),
+            ("Ctrl+N",                  "新建会话"),
+            ("Ctrl+B",                  "切换侧栏"),
+            ("Ctrl+↑ / Ctrl+↓",         "切换会话"),
+            ("Ctrl+O",                  "折叠 / 展开已完成的轮次"),
+            ("Ctrl+U",                  "清空输入框"),
+            ("Ctrl+V",                  "粘贴（图片优先）"),
+            ("↑ / ↓",                   "输入框：浏览发送历史 / 面板内：移动"),
+            ("/",                       "唤起命令面板"),
+            ("Tab",                     "命令面板可见时补全"),
+            ("Esc",                     "取消选择 / 关闭面板 / 关闭帮助"),
+            ("Ctrl+/",                  "显示 / 隐藏本帮助"),
+        ]
+        t = Text()
+        t.append("快捷键帮助\n\n", style=f"bold {C_GREEN}")
+        for k, d in rows:
+            t.append(f"  {k:<22}", style=C_FG)
+            t.append(f"{d}\n", style=C_MUTED)
+        t.append("\n按 Esc 或 Ctrl+/ 关闭", style=C_DIM)
+        return t
 
     def action_complete_command(self) -> None:
         """Tab：命令面板可见时补全到当前高亮命令；否则什么都不做。"""
@@ -732,9 +1065,21 @@ class GenericAgentTUI(App[None]):
 
     # ---------------- input + palette ----------------
     def on_resize(self, event) -> None:
-        self._apply_responsive_layout()
+        # 终端常对一次拖拽连发多个 resize；同尺寸短路避免重复重挂载。
+        size = (self.size.width, self.size.height)
+        if size == self._last_size:
+            return
+        self._last_size = size
+        # 输入框高度自适应即时跑（对延迟敏感）；布局重挂载走 80ms 防抖。
         try: self._resize_input(self.query_one("#input", InputArea))
         except Exception: pass
+        if self._resize_timer is not None:
+            self._resize_timer.stop()
+        self._resize_timer = self.set_timer(0.08, self._flush_resize)
+
+    def _flush_resize(self) -> None:
+        self._resize_timer = None
+        self._apply_responsive_layout()
 
     def _apply_responsive_layout(self) -> None:
         """按终端宽度调侧栏宽 + 主区横向 padding。<70 列隐藏侧栏，宽屏按比例放大。"""
@@ -744,7 +1089,7 @@ class GenericAgentTUI(App[None]):
         except Exception:
             return
         w = self.size.width
-        self._last_width = w
+        self._last_size = (w, self.size.height)
         # 自动隐藏走 -narrow 类，跟用户手动 Ctrl+B 切的 -hidden 互不干扰
         if w < 70:
             sidebar.add_class("-narrow")
@@ -752,7 +1097,8 @@ class GenericAgentTUI(App[None]):
             sidebar.remove_class("-narrow")
             sidebar.styles.width = max(30, min(50, w // 5))
         main.styles.padding = (1, 2) if w < 90 else (1, 6)
-        self._remount_current_session()  # 宽度变了 → markdown 要按新宽重渲
+        # padding 改完 layout 是异步重算；推迟到下一帧再读 #messages.content_region 取新宽
+        self.call_after_refresh(self._remount_current_session)
 
     def _remount_current_session(self) -> None:
         if self.current_id is None or not self.is_mounted:
@@ -802,6 +1148,8 @@ class GenericAgentTUI(App[None]):
         if inp.id != "input":
             return
         text = inp.expand_placeholders(event.value).rstrip()
+        images = re.findall(r"\[Image #\d+: (.*?)\]", text)
+        inp.record_history(event.value)
         inp.reset()
         self._hide_palette()
         self._resize_input(inp)
@@ -814,7 +1162,7 @@ class GenericAgentTUI(App[None]):
             if cmd in self._handlers():
                 self._dispatch_command(cmd, args, raw=text)
                 return
-        self.submit_user_message(text)
+        self.submit_user_message(text, images=images)
 
     def _show_palette(self) -> None:
         self.query_one("#palette", OptionList).add_class("-visible")
@@ -857,6 +1205,36 @@ class GenericAgentTUI(App[None]):
         if isinstance(ol, ChoiceList):
             self._collapse_choice(ol.msg, event.option_index)
             return
+
+    def _active_choice(self) -> Optional["ChoiceList"]:
+        """返回当前 session 里"待选中"的最后一个 ChoiceList widget；无则 None。供 InputArea 路由方向键。"""
+        if self.current_id is None:
+            return None
+        for m in reversed(self.current.messages):
+            if m.kind == "choice" and m.selected_label is None:
+                w = m._body_widget
+                if isinstance(w, ChoiceList):
+                    return w
+        return None
+
+    def _cancel_choice(self, msg: ChatMessage) -> None:
+        """Esc 取消选择：直接移除整个 choice 消息（role / hint / body 三个 widget），
+        不留"已取消"痕迹。session.messages 同步删掉，下次 _refresh 不会重新挂载。"""
+        for w in (msg._role_widget, msg._hint_widget, msg._body_widget):
+            if w is not None:
+                try: w.remove()
+                except Exception: pass
+        msg._role_widget = None
+        msg._hint_widget = None
+        msg._body_widget = None
+        try:
+            self.current.messages.remove(msg)
+        except (ValueError, RuntimeError):
+            pass
+        try:
+            self.query_one("#input", InputArea).focus()
+        except Exception:
+            pass
 
     def _collapse_choice(self, msg: ChatMessage, idx: int) -> None:
         """选中后：执行 on_select → 用结果文本替换 hint+ChoiceList，单条 SYSTEM 消息。"""
@@ -1042,7 +1420,7 @@ class GenericAgentTUI(App[None]):
             choices.append((f"{mark}[{i}] {name}", i))
         msg = ChatMessage(
             role="system",
-            content="选择模型 (↑/↓ 移动，Enter 确认)",
+            content="选择模型 (↑/↓ 移动，→/Enter 确认，Esc 取消)",
             kind="choice",
             choices=choices,
             on_select=lambda v: self._do_switch_llm(v),
@@ -1103,34 +1481,70 @@ class GenericAgentTUI(App[None]):
         self._refresh_all()
 
     def _cmd_export(self, args):
-        sess = self.current
+        """导出命令 —— 形态：
+            /export                 无参 → ChoiceList 三选项（clip/all/file 自动时间戳名）
+            /export clip|copy       最后一轮回复包代码块输出
+            /export all             显示完整日志文件路径
+            /export file [name]     导出最后一轮到文件；name 缺省 → 时间戳；提供 → 用 name
+            /export <name>          旧形式：等价于 /export file <name>（向后兼容）
+        """
         sub = args[0].lower() if args else ""
         if not sub:
-            self._system(
-                "用法:\n"
-                "  /export clip       — 整理到代码块\n"
-                "  /export <文件名>   — 导出到 temp/<文件名>\n"
-                "  /export all        — 显示完整日志路径"
-            ); return
-        if sub == "all":
-            log = getattr(sess.agent, "log_path", "")
-            self._system(f"📂 完整日志:\n{log}" if log and os.path.isfile(log)
-                         else "❌ 尚无日志文件")
+            choices = [
+                ("📋 clip — 复制最后一轮回复（代码块包裹，便于粘贴）", "clip"),
+                ("📂 all  — 显示完整日志文件路径", "all"),
+                ("💾 file — 导出最后一轮回复到 temp/export-<时间戳>.md", "file"),
+            ]
+            msg = ChatMessage(
+                role="system",
+                content="选择导出方式 (↑/↓ 移动，→/Enter 确认，Esc 取消)",
+                kind="choice",
+                choices=choices,
+                on_select=lambda v: self._do_export(v),
+            )
+            self.current.messages.append(msg)
+            self._refresh_messages()
             return
-        try:
-            text = last_assistant_text(sess.agent)
-        except Exception as e:
-            self._system(f"❌ 读取失败: {e}"); return
-        if not text:
-            self._system("❌ 还没有可导出的回复"); return
+        # 显式 file 子命令：可选自定义文件名
+        if sub == "file":
+            custom = " ".join(args[1:]).strip() or None
+            self._system(self._do_export("file", custom))
+            return
+        if sub == "all":
+            self._system(self._do_export("all"))
+            return
         if sub in ("clip", "copy"):
-            self._system(f"📋 最后一轮回复:\n\n{wrap_for_clipboard(text)}")
-        else:
-            try:
-                path = export_to_temp(text, args[0])
-                self._system(f"✅ 已导出: {path}")
-            except Exception as e:
-                self._system(f"❌ 导出失败: {e}")
+            self._system(self._do_export("clip"))
+            return
+        # 旧形式 `/export <filename>` —— 透传为带名 file 导出
+        self._system(self._do_export("file", " ".join(args).strip()))
+
+    def _do_export(self, kind: str, filename: str | None = None) -> str:
+        """统一导出执行器；返回单行/多行结果文本，调用方负责渲染。
+
+        kind="file" 时 filename 缺省→时间戳，提供→直用（不强制扩展名，由 export_to_temp 处理）。
+        """
+        sess = self.current
+        try:
+            if kind == "all":
+                log = getattr(sess.agent, "log_path", "")
+                if log and os.path.isfile(log):
+                    return f"📂 完整日志:\n{log}"
+                return "❌ 尚无日志文件"
+            text = last_assistant_text(sess.agent)
+            if not text:
+                return "❌ 还没有可导出的回复"
+            if kind == "clip":
+                return f"📋 最后一轮回复:\n\n{wrap_for_clipboard(text)}"
+            if kind == "file":
+                if not filename:
+                    from datetime import datetime as _dt
+                    filename = "export-" + _dt.now().strftime("%Y%m%d-%H%M%S") + ".md"
+                path = export_to_temp(text, filename)
+                return f"✅ 已导出: {path}"
+            return f"❌ 未知选项: {kind}"
+        except Exception as e:
+            return f"❌ 导出失败: {type(e).__name__}: {e}"
 
     def _cmd_restore(self, args):
         sess = self.current
@@ -1149,7 +1563,7 @@ class GenericAgentTUI(App[None]):
             self._system(f"❌ 注入失败: {e}")
 
     # ---------------- agent task + stream ----------------
-    def submit_user_message(self, text: str) -> int:
+    def submit_user_message(self, text: str, images: Optional[list[str]] = None) -> int:
         sess = self.current
         if sess.status == "running":
             self._system(f"#{sess.agent_id} 正在跑，/stop 后再发。")
@@ -1159,7 +1573,8 @@ class GenericAgentTUI(App[None]):
         sess.current_task_id = tid
         sess.buffer = ""
         sess.status = "running"
-        sess.messages.append(ChatMessage("user", text))
+        image_paths = list(images or [])
+        sess.messages.append(ChatMessage("user", text, image_paths=image_paths))
         sess.messages.append(ChatMessage("assistant", "", task_id=tid, done=False))
         self._refresh_all()
         try:
@@ -1216,6 +1631,7 @@ class GenericAgentTUI(App[None]):
         if found and found._body_widget is not None:
             try:
                 found._body_widget.update(self._build_assistant_body(found))
+                self.query_one("#messages", VerticalScroll).scroll_end(animate=False)
             except Exception:
                 self._refresh_messages()
         else:
@@ -1242,7 +1658,15 @@ class GenericAgentTUI(App[None]):
         try: model = s.agent.get_llm_name(model=True)
         except Exception: model = "?"
         tasks_running = sum(1 for x in self.sessions.values() if x.status == "running")
-        self.query_one("#topbar", Static).update(render_topbar(s.name, s.status, model, tasks_running))
+        self.query_one("#topbar", Static).update(
+            render_topbar(s.name, s.status, model, tasks_running, fold_mode=self.fold_mode))
+
+    def _refresh_bottombar(self):
+        if not self.is_mounted: return
+        try:
+            self.query_one("#bottombar", Static).update(render_bottombar(quit_armed=self._quit_armed))
+        except Exception:
+            pass
 
     def _refresh_sidebar(self):
         if not self.is_mounted: return
@@ -1325,7 +1749,9 @@ class GenericAgentTUI(App[None]):
         if m.kind == "choice":  # selected_label is not None
             body = Text(); body.append("✓ ", style=C_GREEN); body.append(m.selected_label, style=C_FG)
         elif m.role == "user":
-            body = Text.from_markup(f"[{C_DIM}]>[/] {m.content}")
+            body = Text(); body.append("> ", style=C_DIM); body.append(m.content, style=C_FG)
+            for path in m.image_paths:
+                body.append(f"\n📎 {path}", style=C_MUTED)
         elif m.role == "system":
             body = Text(m.content, style=C_MUTED)
         else:
